@@ -87,22 +87,25 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
     private void requestBTPermissions(CallbackContext callbackContext, JSONObject data) throws JSONException {
         try {
             synchronized (this) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                boolean isS = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S;
+                ArrayList<String> missing = new ArrayList<>();
+                if (isS) {
                     if (!this.cordova.hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
-                        ActivityCompat.requestPermissions(this.cordova.getActivity(), new String[]{Manifest.permission.BLUETOOTH_CONNECT}, PERMISSION_BLUETOOTH_CONNECT);
+                        missing.add(Manifest.permission.BLUETOOTH_CONNECT);
                     }
                     if (!this.cordova.hasPermission(Manifest.permission.BLUETOOTH_SCAN)) {
-                        ActivityCompat.requestPermissions(this.cordova.getActivity(), new String[]{Manifest.permission.BLUETOOTH_SCAN}, PERMISSION_BLUETOOTH_SCAN);
+                        missing.add(Manifest.permission.BLUETOOTH_SCAN);
                     }
-                }else{
+                } else {
                     if (!this.cordova.hasPermission(Manifest.permission.BLUETOOTH)) {
-                        ActivityCompat.requestPermissions(this.cordova.getActivity(), new String[]{Manifest.permission.BLUETOOTH}, PERMISSION_BLUETOOTH);
+                        missing.add(Manifest.permission.BLUETOOTH);
                     }
                     if (!this.cordova.hasPermission(Manifest.permission.BLUETOOTH_ADMIN)) {
-                        ActivityCompat.requestPermissions(this.cordova.getActivity(), new String[]{Manifest.permission.BLUETOOTH_ADMIN}, PERMISSION_BLUETOOTH_ADMIN);
+                        missing.add(Manifest.permission.BLUETOOTH_ADMIN);
                     }
                 }
-                if ((this.cordova.hasPermission(Manifest.permission.BLUETOOTH_CONNECT) || this.cordova.hasPermission(Manifest.permission.BLUETOOTH_SCAN)) || (this.cordova.hasPermission(Manifest.permission.BLUETOOTH) || this.cordova.hasPermission(Manifest.permission.BLUETOOTH_ADMIN))) {
+
+                if (missing.isEmpty()) {
                     CordovaInterface cordova = this.cordova;
                     callbackContext.success(new JSONObject(new HashMap<String, Object>() {{
                         put("granted", true);
@@ -113,7 +116,22 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                     }}));
                     return;
                 }
+
                 this.btCallbackContext = callbackContext;
+                // Uma unica chamada com todas as permissoes pendentes: solicitar em requestPermissions()
+                // separadas (um requestCode por permissao) faz o Android descartar a segunda solicitacao
+                // quando a primeira ainda esta em tela (Android 12+), e o onRequestPermissionsResult dela
+                // nunca chega - o callback JS fica pendente para sempre e a tela trava.
+                final int requestCode = isS ? PERMISSION_BLUETOOTH_CONNECT : PERMISSION_BLUETOOTH;
+                final String[] permissionsToRequest = missing.toArray(new String[0]);
+                // execute() roda esta chamada na thread pool do Cordova, nao na UI thread.
+                // ActivityCompat.requestPermissions() precisa ser chamado na UI thread: fora dela,
+                // o dialogo de permissao pode nunca ser exibido/resolvido (visto em ROMs Sunmi
+                // Android 7/9 e tambem no Android 15), e onRequestPermissionsResult nunca chega -
+                // o callback JS fica pendente para sempre e a tela de busca trava.
+                this.cordova.getActivity().runOnUiThread(() -> {
+                    ActivityCompat.requestPermissions(ThermalPrinterCordovaPlugin.this.cordova.getActivity(), permissionsToRequest, requestCode);
+                });
             }
         } catch (Exception e) {
             CordovaInterface cordova = this.cordova;
@@ -137,7 +155,17 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                 case PERMISSION_BLUETOOTH:
                 case PERMISSION_BLUETOOTH_ADMIN:
                     synchronized (this) {
-                        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                        if (btCallbackContext == null) {
+                            break;
+                        }
+                        boolean allGranted = grantResults.length > 0;
+                        for (int grantResult : grantResults) {
+                            if (grantResult != PackageManager.PERMISSION_GRANTED) {
+                                allGranted = false;
+                                break;
+                            }
+                        }
+                        if (allGranted) {
                             btCallbackContext.success(new JSONObject(new HashMap<String, Object>() {{
                                 put("granted", true);
                             }}));
@@ -146,13 +174,17 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
                                 put("granted", false);
                             }}));
                         }
+                        btCallbackContext = null;
                     }
                     break;
             }
         } catch (JSONException e) {
-            btCallbackContext.error(new JSONObject(new HashMap<String, Object>() {{
-                put("granted", false);
-            }}));
+            if (btCallbackContext != null) {
+                btCallbackContext.error(new JSONObject(new HashMap<String, Object>() {{
+                    put("granted", false);
+                }}));
+                btCallbackContext = null;
+            }
         }
     }
 
@@ -235,12 +267,6 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
 
         String type = data.getString("type");
         if (type.equals("bluetooth")) {
-            // if (!this.cordova.hasPermission(Manifest.permission.BLUETOOTH)) {
-            //     callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
-            //         put("error", "Missing permission for " + Manifest.permission.BLUETOOTH);
-            //     }}));
-            //     return;
-            // }
             if (!this.checkBluetooth(callbackContext)) {
                 return;
             }
@@ -341,12 +367,6 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
             if (!this.checkBluetooth(callbackContext)) {
                 return null;
             }
-            // if (!this.cordova.hasPermission(Manifest.permission.BLUETOOTH)) {
-            //     callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
-            //         put("error", "Missing permission for " + Manifest.permission.DISABLE_KEYGUARD);
-            //     }}));
-            //     return null;
-            // }
             if (id.equals("first")) {
                 return BluetoothPrintersConnections.selectFirstPaired();
             }
@@ -436,6 +456,15 @@ public class ThermalPrinterCordovaPlugin extends CordovaPlugin {
     }
 
     private boolean checkBluetooth(CallbackContext callbackContext) {
+        String requiredPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+            ? Manifest.permission.BLUETOOTH_CONNECT
+            : Manifest.permission.BLUETOOTH;
+        if (!this.cordova.hasPermission(requiredPermission)) {
+            callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
+                put("error", "Missing permission for " + requiredPermission);
+            }}));
+            return false;
+        }
         BluetoothAdapter mBluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
         if (mBluetoothAdapter == null) {
             callbackContext.error(new JSONObject(new HashMap<String, Object>() {{
